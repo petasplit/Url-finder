@@ -8,10 +8,15 @@ import logging
 import time
 import subprocess
 import shlex
+import signal
+import os
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Global variable to store discovered URLs
+discovered_urls = set()
 
 # Comprehensive list of common hidden directories, files, and query parameters
 common_paths = [
@@ -50,6 +55,31 @@ common_query_params = [
     'import', 'export', 'load', 'save', 'upload', 'download',
     'change', 'modify', 'rename', 'copy', 'move', 'print', 'printable'
 ]
+
+# Global variable to control script termination
+terminate_script = False
+
+def signal_handler(sig, frame):
+    global terminate_script
+    logger.info("Termination signal received, finishing up...")
+    terminate_script = True
+
+# Attach signal handler
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
+# Function to save discovered URLs periodically
+async def periodic_save(filename, interval=60):
+    while not terminate_script:
+        await asyncio.sleep(interval)
+        logger.info(f"Periodic save: saving discovered URLs to {filename}")
+        save_urls(filename)
+
+def save_urls(filename):
+    with open(filename, 'w') as f:
+        for url in discovered_urls:
+            f.write(url + "\n")
+    logger.info(f"URLs saved to {filename}")
 
 # Additional external URL sources
 async def fetch_external_urls(domain):
@@ -150,13 +180,16 @@ async def fetch_external_urls(domain):
     # SecurityTrails URLs
     securitytrails_url = f"https://api.securitytrails.com/v1/domain/{domain}/subdomains"
     try:
+        headers = {
+            "APIKEY": "YOUR_SECURITY_TRAILS_API_KEY"
+        }
         async with aiohttp.ClientSession() as session:
-            async with session.get(securitytrails_url, headers={'APIKEY': 'YOUR_API_KEY_HERE'}) as response:
+            async with session.get(securitytrails_url, headers=headers) as response:
                 if response.status == 200:
                     securitytrails_data = await response.json()
-                    securitytrails_urls = [f"http://{subdomain}.{domain}" for subdomain in securitytrails_data['subdomains']]
-                    urls.update(securitytrails_urls)
-                    logger.info(f"Discovered {len(securitytrails_urls)} URLs from SecurityTrails")
+                    st_urls = [f"http://{subdomain}.{domain}" for subdomain in securitytrails_data['subdomains']]
+                    urls.update(st_urls)
+                    logger.info(f"Discovered {len(st_urls)} URLs from SecurityTrails")
                 else:
                     logger.warning(f"Failed to fetch URLs from SecurityTrails: Status {response.status}")
     except Exception as e:
@@ -164,113 +197,92 @@ async def fetch_external_urls(domain):
 
     return urls
 
-# Asynchronous function to fetch and parse a URL
-async def fetch_and_parse(session, url):
+# URL discovery function using BeautifulSoup
+async def discover_urls(session, url, domain):
     try:
-        async with session.get(url, timeout=10) as response:
+        async with session.get(url) as response:
             if response.status == 200:
-                html = await response.text()
-                soup = BeautifulSoup(html, 'html.parser')
-                return soup
+                soup = BeautifulSoup(await response.text(), 'html.parser')
+
+                # Extract links
+                for link in soup.find_all('a', href=True):
+                    href = link['href']
+                    if href.startswith('/'):
+                        full_url = urljoin(url, href)
+                    elif href.startswith('http'):
+                        full_url = href
+                    else:
+                        full_url = None
+                    
+                    if full_url and domain in urlparse(full_url).netloc:
+                        discovered_urls.add(full_url)
+                        logger.info(f"Discovered URL: {full_url}")
+
+                # Check for common hidden directories and files
+                for path in common_paths:
+                    test_url = urljoin(url, path)
+                    discovered_urls.add(test_url)
+                    logger.info(f"Generated URL: {test_url}")
+
+                # Check for common query parameters
+                for param in common_query_params:
+                    for value in ['1', 'true', 'admin', 'test']:
+                        test_url = f"{url}?{param}={value}"
+                        discovered_urls.add(test_url)
+                        logger.info(f"Generated URL with query parameter: {test_url}")
     except Exception as e:
-        logger.error(f"Failed to fetch {url}: {e}")
-    return None
+        logger.error(f"Error discovering URLs at {url}: {e}")
 
-# Function to discover URLs from the starting page
-async def discover_urls(session, url):
-    discovered_urls = set()
-    soup = await fetch_and_parse(session, url)
-    if soup:
-        # Extract all links from the page
-        for link in soup.find_all('a', href=True):
-            href = link.get('href')
-            full_url = urljoin(url, href)
-            discovered_urls.add(full_url)
-        
-        # Extract JavaScript URLs
-        for script in soup.find_all('script', src=True):
-            src = script.get('src')
-            full_url = urljoin(url, src)
-            discovered_urls.add(full_url)
-        
-        # Extract form actions
-        for form in soup.find_all('form', action=True):
-            action = form.get('action')
-            full_url = urljoin(url, action)
-            discovered_urls.add(full_url)
-
-    return discovered_urls
-
-# Function to discover hidden endpoints using common paths and query parameters
-async def discover_hidden_urls(session, url):
-    discovered_urls = set()
-    base_url = url.rstrip('/')
-
-    for path in common_paths:
-        full_url = f"{base_url}/{path}"
-        discovered_urls.add(full_url)
-
-    for param in common_query_params:
-        full_url = f"{base_url}?{param}=test"
-        discovered_urls.add(full_url)
-
-    return discovered_urls
-
-# Recursive function to scrape URLs
-async def recursive_scrape(url, session, max_depth, current_depth, visited, max_tasks):
-    if current_depth > max_depth:
-        return visited
-
-    logger.info(f"Scraping URL: {url} at depth {current_depth}")
-    urls_to_visit = await discover_urls(session, url)
-    urls_to_visit.update(await discover_hidden_urls(session, url))
-
-    tasks = []
-    semaphore = asyncio.Semaphore(max_tasks)
-
-    async def visit_url(url):
-        async with semaphore:
-            if url not in visited and urlparse(url).netloc == urlparse(url).netloc:
-                visited.add(url)
-                logger.info(f"Found URL: {url}")
-                await recursive_scrape(url, session, max_depth, current_depth + 1, visited, max_tasks)
-
-    for url in urls_to_visit:
-        if url not in visited:
-            tasks.append(visit_url(url))
-
-    await asyncio.gather(*tasks)
-
-    return visited
+# Function to start the web server for the discovered URLs
+def start_web_server(port=8080):
+    if os.path.exists('discovered_urls.txt'):
+        command = f"python3 -m http.server {port}"
+        process = subprocess.Popen(shlex.split(command))
+        logger.info(f"Serving discovered URLs on http://localhost:{port}")
+        return process
+    else:
+        logger.error("discovered_urls.txt not found. Cannot start web server.")
+        return None
 
 # Main function
-async def main():
-    # Prompt the user for a starting URL
-    start_url = input("Enter the starting URL: ").strip()
-    max_depth = int(input("Enter the maximum depth to scrape (e.g., 5): ").strip())
-    max_tasks = int(input("Enter the maximum number of concurrent tasks (e.g., 20): ").strip())
+async def main(domain, output_filename):
+    # Initialize HTTP session
+    async with aiohttp.ClientSession() as session:
+        # Fetch external URLs
+        external_urls = await fetch_external_urls(domain)
+        discovered_urls.update(external_urls)
 
-    domain = urlparse(start_url).netloc
-
-    # Fetch URLs from external sources
-    external_urls = await fetch_external_urls(domain)
-
-    async with ClientSession() as session:
-        # Scrape the starting URL and other discovered URLs
-        all_urls = await recursive_scrape(start_url, session, max_depth=max_depth, current_depth=0, visited=set(), max_tasks=max_tasks)
-        all_urls.update(external_urls)
+        # Start URL discovery
+        logger.info("Starting URL discovery...")
+        await discover_urls(session, f"http://{domain}", domain)
         
-        # Save the results to a file with only discovered URLs
-        discovered_urls = list(all_urls)
-        timestamp = int(time.time())
-        output_file = f'discovered_urls_{timestamp}.txt'
-        with open(output_file, 'w') as f:
-            for url in discovered_urls:
-                f.write(url + "\n")
+        # Start periodic save task
+        save_task = asyncio.create_task(periodic_save(output_filename))
         
-        logger.info(f"Total URLs found: {len(discovered_urls)}")
-        logger.info(f"Results saved to {output_file}")
+        # Wait for the termination signal
+        while not terminate_script:
+            await asyncio.sleep(1)
+        
+        # Save final discovered URLs
+        save_urls(output_filename)
+        
+        # Cancel the periodic save task
+        save_task.cancel()
 
-# Run the script
-if __name__ == "__main__":
-    asyncio.run(main())
+if __name__ == '__main__':
+    domain = 'example.com'  # Replace with the target domain
+    output_filename = 'discovered_urls.txt'
+    
+    # Start the main process
+    asyncio.run(main(domain, output_filename))
+    
+    # Start web server to serve the discovered URLs
+    process = start_web_server(port=8080)
+
+    # Wait for termination signal to stop the web server
+    while not terminate_script:
+        time.sleep(1)
+    
+    if process:
+        process.terminate()
+        logger.info("Web server stopped.")
