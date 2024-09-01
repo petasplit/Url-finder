@@ -169,25 +169,6 @@ async def fetch_external_urls(domain):
     except Exception as e:
         logger.error(f"Failed to fetch URLs from Wayback Machine: {e}")
     
-    # VirusTotal URLs
-    vt_url = f"https://www.virustotal.com/ui/domains/{domain}/urls?limit=40"
-    retry_attempts = 5
-    for attempt in range(retry_attempts):
-        try:
-            vt_data = await fetch_external_data(vt_url)
-            vt_urls = [item['attributes']['url'] for item in vt_data['data']]
-            urls.update(vt_urls)
-            logger.info(f"Discovered {len(vt_urls)} URLs from VirusTotal")
-            break
-        except aiohttp.ClientResponseError as e:
-            if e.status == 429 and attempt < retry_attempts - 1:
-                wait_time = 2 ** attempt
-                logger.warning(f"Rate limit exceeded for VirusTotal. Retrying in {wait_time} seconds...")
-                await asyncio.sleep(wait_time)
-            else:
-                logger.error(f"Failed to fetch URLs from VirusTotal: {e}")
-                break
-    
     # crt.sh (Certificate Transparency Logs)
     crtsh_url = f"https://crt.sh/?q={domain}&output=json"
     try:
@@ -230,30 +211,34 @@ async def fetch_external_urls(domain):
     except Exception as e:
         logger.error(f"Failed to fetch URLs from AlienVault OTX: {e}")
     
-    # PublicWWW URLs
-    public_www_url = f"https://publicwww.com/websites/{domain}/"
-    try:
-        public_www_response = subprocess.check_output(shlex.split(f"curl -s '{public_www_url}'"))
-        public_www_data = public_www_response.decode()
-        public_www_urls = re.findall(r'href="([^"]*?{domain}[^"]*?)"', public_www_data)
-        urls.update(public_www_urls)
-        logger.info(f"Discovered {len(public_www_urls)} URLs from PublicWWW")
-    except Exception as e:
-        logger.error(f"Failed to fetch URLs from PublicWWW: {e}")
+    # Additional Services
+    services = [
+        {"name": "Shodan", "url": f"https://api.shodan.io/shodan/host/search?query=hostname:{domain}&key=YOUR_API_KEY"},
+        {"name": "SecurityTrails", "url": f"https://api.securitytrails.com/v1/domain/{domain}/subdomains", "headers": {"APIKEY": "YOUR_API_KEY"}},
+        {"name": "Hunter.io", "url": f"https://api.hunter.io/v2/domain-search?domain={domain}&api_key=YOUR_API_KEY"},
+        {"name": "Censys", "url": f"https://search.censys.io/api/v1/search/hosts?query={domain}", "headers": {"Authorization": "Basic YOUR_API_KEY"}},
+        {"name": "GreyNoise", "url": f"https://api.greynoise.io/v3/search/actor?query=domain:{domain}", "headers": {"Authorization": "Bearer YOUR_API_KEY"}},
+        {"name": "Spyse", "url": f"https://api.spyse.com/v4/data/domain/subdomains?domain={domain}&token=YOUR_API_KEY"},
+        {"name": "Have I Been Pwned", "url": f"https://haveibeenpwned.com/api/v3/breachedaccount/{domain}", "headers": {"User-Agent": "YourAppName"}},
+        {"name": "Snyk", "url": f"https://snyk.io/api/v1/organizations/{domain}/projects", "headers": {"Authorization": "token YOUR_API_KEY"}},
+        {"name": "HackerTarget", "url": f"https://api.hackertarget.com/hostsearch/?q={domain}"},
+        {"name": "URLScan.io", "url": f"https://urlscan.io/api/v1/search/?q={domain}"}
+    ]
     
-    # URLScan.io URLs
-    urlscan_url = f"https://urlscan.io/api/v1/search/?q=domain:{domain}"
-    try:
-        urlscan_data = await fetch_external_data(urlscan_url)
-        if isinstance(urlscan_data, dict):
-            urlscan_urls = [result['task']['url'] for result in urlscan_data.get('results', [])]
-            urls.update(urlscan_urls)
-            logger.info(f"Discovered {len(urlscan_urls)} URLs from URLScan.io")
-        else:
-            logger.error(f"Failed to fetch URLs from URLScan.io: Expected a dict, got {type(urlscan_data).__name__}")
-    except Exception as e:
-        logger.error(f"Failed to fetch URLs from URLScan.io: {e}")
-    
+    for service in services:
+        try:
+            response_data = await fetch_external_data(service["url"], headers=service.get("headers"))
+            if isinstance(response_data, dict):
+                urls.update(response_data.get("urls", []))
+                logger.info(f"Discovered URLs from {service['name']}")
+            elif isinstance(response_data, list):
+                urls.update([entry.get('url') for entry in response_data])
+                logger.info(f"Discovered URLs from {service['name']}")
+            else:
+                logger.error(f"Failed to fetch URLs from {service['name']}: Unexpected response format")
+        except Exception as e:
+            logger.error(f"Failed to fetch URLs from {service['name']}: {e}")
+
     return urls
 
 # Recursive function to scrape URLs
