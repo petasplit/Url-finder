@@ -19,8 +19,42 @@ logger = logging.getLogger(__name__)
 discovered_urls = set()
 
 # Comprehensive list of common hidden directories, files, and query parameters
-common_paths = [ ... ]  # as before
-common_query_params = [ ... ]  # as before
+common_paths = [
+    'admin', 'login', 'dashboard', 'hidden', '.git', '.env', 'api', 
+    'config', 'uploads', 'backup', 'backups', 'database', 'db', 
+    'js', 'css', 'assets', 'private', 'secret', 'tmp', 'temp', 
+    'old', 'test', 'staging', 'logs', 'robots.txt', 'sitemap.xml',
+    'cgi-bin', 'index.php', 'index.html', 'index.asp', 'wp-admin', 
+    'wp-login.php', 'user', 'signup', 'register', 'auth', 'signin', 
+    'checkout', 'cart', 'store', 'catalog', 'product', 'category', 
+    'image', 'images', 'img', 'scripts', 'media', 'admin.php',
+    'forgot-password', 'reset-password', 'account', 'settings', 
+    'profile', 'debug', 'v1', 'v2', 'v3', 'v4', 'beta', 'alpha', 
+    'version', 'api/v1', 'api/v2', 'api/v3', 'old', 'new', 'secure',
+    'private', 'adminarea', 'editor', 'panel', 'control', 'manager',
+    'manage', 'bin', 'core', 'public', 'restricted', 'api/hidden',
+    'uploads/hidden', 'downloads', 'docs', 'documentation', 
+    'includes', 'inc', 'src', 'source', 'code', 'shell', 'dev',
+    'development', 'lib', 'library', 'vendor', 'plugins', 'modules',
+    'cgi', 'phpmyadmin', 'mysql', 'adminpanel', 'testadmin', 
+    'controlpanel', 'securepanel', 'services', 'connect', 'contact'
+]
+
+common_query_params = [
+    'id', 'page', 'search', 'query', 'lang', 'view', 'category', 
+    'product', 'type', 'filter', 'item', 'sort', 'order', 'key', 
+    'token', 'session', 'user', 'password', 'login', 'redirect', 
+    'next', 'source', 'ref', 'referrer', 'email', 'file', 'action',
+    'do', 'cmd', 'exec', 'process', 'state', 'status', 'dir', 
+    'directory', 'module', 'plugin', 'extension', 'theme', 
+    'template', 'admin', 'config', 'debug', 'debugger', 'log',
+    'file', 'report', 'trace', 'download', 'fetch', 'save', 'restore',
+    'get', 'put', 'post', 'update', 'delete', 'remove', 'create',
+    'insert', 'update', 'delete', 'backup', 'restore', 'install', 
+    'uninstall', 'setup', 'init', 'initialize', 'migration', 
+    'import', 'export', 'load', 'save', 'upload', 'download',
+    'change', 'modify', 'rename', 'copy', 'move', 'print', 'printable'
+]
 
 # Global variable to control script termination
 terminate_script = False
@@ -35,7 +69,7 @@ signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
 # Function to save discovered URLs periodically
-async def periodic_save(filename, interval=60):
+async def periodic_save(filename, interval=10):
     while not terminate_script:
         await asyncio.sleep(interval)
         logger.info(f"Periodic save: saving discovered URLs to {filename}")
@@ -109,7 +143,11 @@ async def fetch_external_data(url, headers=None):
         async with session.get(url, headers=headers) as response:
             if response.status == 200:
                 try:
-                    return await response.json()
+                    content_type = response.headers.get('Content-Type', '')
+                    if 'application/json' in content_type:
+                        return await response.json()
+                    else:
+                        return await response.text()
                 except aiohttp.ContentTypeError:
                     logger.warning(f"Unexpected MIME type for URL {url}")
                     return await response.text()
@@ -124,32 +162,42 @@ async def fetch_external_urls(domain):
     wayback_url = f"http://web.archive.org/cdx/search/cdx?url={domain}/*&output=txt&fl=original&collapse=urlkey"
     try:
         wayback_response = await fetch_external_data(wayback_url)
-        wayback_urls = wayback_response.splitlines()
-        urls.update(wayback_urls)
-        logger.info(f"Discovered {len(wayback_urls)} URLs from Wayback Machine")
+        if isinstance(wayback_response, str):
+            wayback_urls = wayback_response.splitlines()
+            urls.update(wayback_urls)
+            logger.info(f"Discovered {len(wayback_urls)} URLs from Wayback Machine")
     except Exception as e:
         logger.error(f"Failed to fetch URLs from Wayback Machine: {e}")
     
     # VirusTotal URLs
     vt_url = f"https://www.virustotal.com/ui/domains/{domain}/urls?limit=40"
-    try:
-        vt_data = await fetch_external_data(vt_url)
-        vt_urls = [item['attributes']['url'] for item in vt_data['data']]
-        urls.update(vt_urls)
-        logger.info(f"Discovered {len(vt_urls)} URLs from VirusTotal")
-    except aiohttp.ClientResponseError as e:
-        if e.status == 429:
-            logger.warning("Rate limit exceeded for VirusTotal. Implementing retry strategy is advised.")
-        else:
-            logger.error(f"Failed to fetch URLs from VirusTotal: {e}")
+    retry_attempts = 5
+    for attempt in range(retry_attempts):
+        try:
+            vt_data = await fetch_external_data(vt_url)
+            vt_urls = [item['attributes']['url'] for item in vt_data['data']]
+            urls.update(vt_urls)
+            logger.info(f"Discovered {len(vt_urls)} URLs from VirusTotal")
+            break
+        except aiohttp.ClientResponseError as e:
+            if e.status == 429 and attempt < retry_attempts - 1:
+                wait_time = 2 ** attempt
+                logger.warning(f"Rate limit exceeded for VirusTotal. Retrying in {wait_time} seconds...")
+                await asyncio.sleep(wait_time)
+            else:
+                logger.error(f"Failed to fetch URLs from VirusTotal: {e}")
+                break
     
     # crt.sh (Certificate Transparency Logs)
     crtsh_url = f"https://crt.sh/?q={domain}&output=json"
     try:
         crtsh_data = await fetch_external_data(crtsh_url)
-        crtsh_urls = re.findall(rf'"common_name":"(.*?{domain})"', crtsh_data)
-        urls.update(crtsh_urls)
-        logger.info(f"Discovered {len(crtsh_urls)} URLs from crt.sh")
+        if isinstance(crtsh_data, list):
+            crtsh_urls = [entry['common_name'] for entry in crtsh_data if domain in entry['common_name']]
+            urls.update(crtsh_urls)
+            logger.info(f"Discovered {len(crtsh_urls)} URLs from crt.sh")
+        else:
+            logger.error(f"Failed to fetch URLs from crt.sh: Expected a list, got {type(crtsh_data).__name__}")
     except Exception as e:
         logger.error(f"Failed to fetch URLs from crt.sh: {e}")
     
@@ -157,9 +205,12 @@ async def fetch_external_urls(domain):
     common_crawl_url = f"https://index.commoncrawl.org/CC-MAIN-2023-18-index?url={domain}&output=json"
     try:
         cc_data = await fetch_external_data(common_crawl_url)
-        cc_urls = [entry['url'] for entry in cc_data]
-        urls.update(cc_urls)
-        logger.info(f"Discovered {len(cc_urls)} URLs from Common Crawl")
+        if isinstance(cc_data, list):
+            cc_urls = [entry['url'] for entry in cc_data]
+            urls.update(cc_urls)
+            logger.info(f"Discovered {len(cc_urls)} URLs from Common Crawl")
+        else:
+            logger.error(f"Failed to fetch URLs from Common Crawl: Expected a list, got {type(cc_data).__name__}")
     except aiohttp.ClientResponseError as e:
         if e.status == 404:
             logger.warning("Common Crawl data not found.")
@@ -170,9 +221,12 @@ async def fetch_external_urls(domain):
     otx_url = f"https://otx.alienvault.com/api/v1/indicators/domain/{domain}/url_list"
     try:
         otx_data = await fetch_external_data(otx_url)
-        otx_urls = [entry['url'] for entry in otx_data['url_list']]
-        urls.update(otx_urls)
-        logger.info(f"Discovered {len(otx_urls)} URLs from AlienVault OTX")
+        if isinstance(otx_data, dict):
+            otx_urls = [entry['url'] for entry in otx_data.get('url_list', [])]
+            urls.update(otx_urls)
+            logger.info(f"Discovered {len(otx_urls)} URLs from AlienVault OTX")
+        else:
+            logger.error(f"Failed to fetch URLs from AlienVault OTX: Expected a dict, got {type(otx_data).__name__}")
     except Exception as e:
         logger.error(f"Failed to fetch URLs from AlienVault OTX: {e}")
     
@@ -191,23 +245,15 @@ async def fetch_external_urls(domain):
     urlscan_url = f"https://urlscan.io/api/v1/search/?q=domain:{domain}"
     try:
         urlscan_data = await fetch_external_data(urlscan_url)
-        urlscan_urls = [result['task']['url'] for result in urlscan_data['results']]
-        urls.update(urlscan_urls)
-        logger.info(f"Discovered {len(urlscan_urls)} URLs from URLScan.io")
+        if isinstance(urlscan_data, dict):
+            urlscan_urls = [result['task']['url'] for result in urlscan_data.get('results', [])]
+            urls.update(urlscan_urls)
+            logger.info(f"Discovered {len(urlscan_urls)} URLs from URLScan.io")
+        else:
+            logger.error(f"Failed to fetch URLs from URLScan.io: Expected a dict, got {type(urlscan_data).__name__}")
     except Exception as e:
         logger.error(f"Failed to fetch URLs from URLScan.io: {e}")
     
-    # SecurityTrails URLs
-    securitytrails_url = f"https://api.securitytrails.com/v1/domain/{domain}/subdomains"
-    try:
-        headers = {'APIKEY': 'YOUR_API_KEY_HERE'}
-        securitytrails_data = await fetch_external_data(securitytrails_url, headers=headers)
-        securitytrails_urls = [f"http://{subdomain}.{domain}" for subdomain in securitytrails_data['subdomains']]
-        urls.update(securitytrails_urls)
-        logger.info(f"Discovered {len(securitytrails_urls)} URLs from SecurityTrails")
-    except Exception as e:
-        logger.error(f"Failed to fetch URLs from SecurityTrails: {e}")
-
     return urls
 
 # Recursive function to scrape URLs
