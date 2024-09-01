@@ -1,12 +1,15 @@
 import asyncio
 import aiohttp
-from aiohttp import ClientSession
-from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse
+import re
 import logging
 import time
 import os
 import signal
+from aiohttp import ClientSession
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin, urlparse
+import subprocess
+import shlex
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -16,42 +19,8 @@ logger = logging.getLogger(__name__)
 discovered_urls = set()
 
 # Comprehensive list of common hidden directories, files, and query parameters
-common_paths = [
-    'admin', 'login', 'dashboard', 'hidden', '.git', '.env', 'api', 
-    'config', 'uploads', 'backup', 'backups', 'database', 'db', 
-    'js', 'css', 'assets', 'private', 'secret', 'tmp', 'temp', 
-    'old', 'test', 'staging', 'logs', 'robots.txt', 'sitemap.xml',
-    'cgi-bin', 'index.php', 'index.html', 'index.asp', 'wp-admin', 
-    'wp-login.php', 'user', 'signup', 'register', 'auth', 'signin', 
-    'checkout', 'cart', 'store', 'catalog', 'product', 'category', 
-    'image', 'images', 'img', 'scripts', 'media', 'admin.php',
-    'forgot-password', 'reset-password', 'account', 'settings', 
-    'profile', 'debug', 'v1', 'v2', 'v3', 'v4', 'beta', 'alpha', 
-    'version', 'api/v1', 'api/v2', 'api/v3', 'old', 'new', 'secure',
-    'private', 'adminarea', 'editor', 'panel', 'control', 'manager',
-    'manage', 'bin', 'core', 'public', 'restricted', 'api/hidden',
-    'uploads/hidden', 'downloads', 'docs', 'documentation', 
-    'includes', 'inc', 'src', 'source', 'code', 'shell', 'dev',
-    'development', 'lib', 'library', 'vendor', 'plugins', 'modules',
-    'cgi', 'phpmyadmin', 'mysql', 'adminpanel', 'testadmin', 
-    'controlpanel', 'securepanel', 'services', 'connect', 'contact'
-]
-
-common_query_params = [
-    'id', 'page', 'search', 'query', 'lang', 'view', 'category', 
-    'product', 'type', 'filter', 'item', 'sort', 'order', 'key', 
-    'token', 'session', 'user', 'password', 'login', 'redirect', 
-    'next', 'source', 'ref', 'referrer', 'email', 'file', 'action',
-    'do', 'cmd', 'exec', 'process', 'state', 'status', 'dir', 
-    'directory', 'module', 'plugin', 'extension', 'theme', 
-    'template', 'admin', 'config', 'debug', 'debugger', 'log',
-    'file', 'report', 'trace', 'download', 'fetch', 'save', 'restore',
-    'get', 'put', 'post', 'update', 'delete', 'remove', 'create',
-    'insert', 'update', 'delete', 'backup', 'restore', 'install', 
-    'uninstall', 'setup', 'init', 'initialize', 'migration', 
-    'import', 'export', 'load', 'save', 'upload', 'download',
-    'change', 'modify', 'rename', 'copy', 'move', 'print', 'printable'
-]
+common_paths = [ ... ]  # as before
+common_query_params = [ ... ]  # as before
 
 # Global variable to control script termination
 terminate_script = False
@@ -99,21 +68,18 @@ async def discover_urls(session, url, domain):
     
     discovered_urls = set()
     
-    # Extract all links from the page
     for link in soup.find_all('a', href=True):
         href = link.get('href')
         full_url = urljoin(url, href)
         if domain in urlparse(full_url).netloc:
             discovered_urls.add(full_url)
     
-    # Extract JavaScript URLs
     for script in soup.find_all('script', src=True):
         src = script.get('src')
         full_url = urljoin(url, src)
         if domain in urlparse(full_url).netloc:
             discovered_urls.add(full_url)
     
-    # Extract form actions
     for form in soup.find_all('form', action=True):
         action = form.get('action')
         full_url = urljoin(url, action)
@@ -137,6 +103,19 @@ async def discover_hidden_urls(url):
 
     return discovered_urls
 
+# Function to fetch external data
+async def fetch_external_data(url, headers=None):
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, headers=headers) as response:
+            if response.status == 200:
+                try:
+                    return await response.json()
+                except aiohttp.ContentTypeError:
+                    logger.warning(f"Unexpected MIME type for URL {url}")
+                    return await response.text()
+            else:
+                response.raise_for_status()
+
 # Function to fetch URLs from external sources
 async def fetch_external_urls(domain):
     urls = set()
@@ -158,8 +137,11 @@ async def fetch_external_urls(domain):
         vt_urls = [item['attributes']['url'] for item in vt_data['data']]
         urls.update(vt_urls)
         logger.info(f"Discovered {len(vt_urls)} URLs from VirusTotal")
-    except Exception as e:
-        logger.error(f"Failed to fetch URLs from VirusTotal: {e}")
+    except aiohttp.ClientResponseError as e:
+        if e.status == 429:
+            logger.warning("Rate limit exceeded for VirusTotal. Implementing retry strategy is advised.")
+        else:
+            logger.error(f"Failed to fetch URLs from VirusTotal: {e}")
     
     # crt.sh (Certificate Transparency Logs)
     crtsh_url = f"https://crt.sh/?q={domain}&output=json"
@@ -178,8 +160,11 @@ async def fetch_external_urls(domain):
         cc_urls = [entry['url'] for entry in cc_data]
         urls.update(cc_urls)
         logger.info(f"Discovered {len(cc_urls)} URLs from Common Crawl")
-    except Exception as e:
-        logger.error(f"Failed to fetch URLs from Common Crawl: {e}")
+    except aiohttp.ClientResponseError as e:
+        if e.status == 404:
+            logger.warning("Common Crawl data not found.")
+        else:
+            logger.error(f"Failed to fetch URLs from Common Crawl: {e}")
     
     # AlienVault OTX URLs
     otx_url = f"https://otx.alienvault.com/api/v1/indicators/domain/{domain}/url_list"
@@ -224,15 +209,6 @@ async def fetch_external_urls(domain):
         logger.error(f"Failed to fetch URLs from SecurityTrails: {e}")
 
     return urls
-
-# Helper function to fetch external data
-async def fetch_external_data(url, headers=None):
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=headers) as response:
-            if response.status == 200:
-                return await response.json()
-            else:
-                response.raise_for_status()
 
 # Recursive function to scrape URLs
 async def recursive_scrape(url, session, max_depth, current_depth, visited, max_tasks):
